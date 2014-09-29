@@ -1,4 +1,9 @@
 #!/bin/bash
+readonly VERSION="0.1.12"
+readonly SSHOPTIONS="-o UserKnownHostsFile /dev/null -o StrictHostKeyChecking no -o LogLevel=quiet"
+
+# Load configuration
+source ~/.kran/kran.conf
 
 function kran_logo(){
   cat <<EOF
@@ -8,7 +13,7 @@ function kran_logo(){
  |X|    _ ¿_                use to handle your
  |X| __| '__|_  _ ___       containers?
  |X|/ /| |/   \| '__ |
- |X| < |_| (_) | | | |
+ |X| < |_| (_) | | | |      v. $VERSION
  |X|\_\   \__|_|_| |_|
 
 EOF
@@ -17,94 +22,157 @@ EOF
 function kran_usage(){
   cat <<EOF
 usage `basename $0`
-    up - start container
+    up [site] - start container
+    stop [site] - stop container
+    status - show running sites
     build - build docker containers
     ssh - connect to container
-    drush, d - execute drush command in container
     clean - kill all containers, and remove them
     init-site [name] - initialize site
+    bootvm - Start VM and other mac stuff
 
 EOF
 }
 
+# find relative directory
+ARCH=$(uname)
+
+if [ "$ARCH" == "Darwin" ]; then
+  export DOCKER_HOST=tcp://kran:2375
+  LOCAL_SITES=/Volumes/sites/
+else
+  LOCAL_SITES=$SITES
+fi
+
+
+PWD=$(pwd)
+WD=${PWD/$LOCAL_SITES/}
+DIR=${WD#*/}
+#find site from path
+IFS='/' read -ra ADDR <<< "$WD"
+SITE=${ADDR[0]}
+
+if [[ -z $SITE ]]; then
+  SITE=$2
+fi
+
+function bootvm(){
+  if [ "$ARCH" == "Darwin" ]; then
+    if [ "$(boot2docker status)" != "running" ]; then
+      if [ "$1" == "up" ]; then
+        echo "==> Start boot2docker VM and other mac stuff"
+        boot2docker start
+
+        echo "==> Set up Volume container"
+        docker rm kran-data
+        docker run  -v /var/lib/boot2docker/sites:/sites --name kran-data busybox true
+
+        echo "==> Share volume container with samba"
+        docker run --rm -v $(which docker):/docker -v /var/run/docker.sock:/docker.sock svendowideit/samba kran-data
+
+        echo "==> Mount sites directory"
+        mkdir -p /Volumes/sites
+        mount -t smbfs //guest@192.168.59.103/sites /Volumes/sites
+      else
+        echo "boot2docker vm isn't running, 'kran bootvm' to get started"
+        exit 1
+      fi
+    fi
+  fi
+}
+
 function init(){
-  export DOCKER_HOST=tcp://localhost:4243
-  source ~/.kran/kran.conf
-
-  # find relative directory
-  PWD=$(pwd)
-  WD=${PWD/$LOCAL_SITES/}
-  DIR=${WD#*/}
-
-  #find site from path
-  IFS='/' read -ra ADDR <<< "$WD"
-  SITE=${ADDR[0]}
-
-  source $LOCAL_SITES$SITE/ports
-
-  if [[ -z $SITE ]]; then
+  if [[ -z $SITE ]] || [[ ! -f "$LOCAL_SITES$SITE/ports" ]]; then
     echo "Couldn't determine site, correct directory?";
     exit 1;
   fi
+  source $LOCAL_SITES$SITE/ports
 }
 
 function start(){
+  if [[ -f "$LOCAL_SITES$SITE/config" ]]; then
+    source $LOCAL_SITES$SITE/config
+  fi
 
-# Run mailcatcher
-  MAILCATCHER_IS_RUNNING=`netstat -tna | grep 1025 | wc -l`
-  if [[ $MAILCATCHER_IS_RUNNING == 0 ]]; then
+  # Run mailcatcher
+  if [ "$ARCH" == "Darwin" ]; then
+    mailcatcher --smtp-ip 192.168.33.1
+  else
     mailcatcher --smtp-ip 172.17.42.1
   fi
 
-  echo "Running docker with site $1"
-  echo -e "==> http://localhost:"'\e[0;32m'$HTTP'\e[0m'
-  echo -e "==> ssh root@localhost -p "'\e[0;32m'$SSH'\e[0m'
+  echo ""
+  echo "Running docker with site: $SITE"
+  echo "==> http://kran:"$HTTP
+  echo "==> ssh root@kran -p "$SSH
   echo ""
 
-  # Check if were running on a mac. If we are, we keep mysql
-  # in the vagrant box.
-  if [ "$(uname)" == "Darwin" ]; then
-    PARAMS="run --rm -t -i -p $HTTP:80 -p $SSH:22 -dns 8.8.8.8\
-      -v $SITES$SITE/www:/var/www\
-      -v /mnt/sda/lib/mysql:/var/lib/mysql\
-     tth/wheezy /opt/start_supervisor_log.sh"
-  else
-    PARAMS="run --rm -t -i -p $HTTP:80 -p $SSH:22 -dns 8.8.8.8\
-      -v $SITES$SITE/www:/var/www\
-      -v $SITES$SITE/mysql:/var/lib/mysql\
-     tth/wheezy /opt/start_supervisor_log.sh"
-  fi
   # Run docker, map directories
-  docker $PARAMS
+  docker run -p $HTTP:80 -p $SSH:22 --dns 8.8.8.8\
+    -v $SITES$SITE/www:/var/www\
+    -v $SITES$SITE/vhost:/etc/apache2/sites-enabled\
+    -v $SITES$SITE/mysql:/var/lib/mysql\
+    -d $IMAGE /opt/start.sh > /dev/null
+}
+
+function stop(){
+  echo "Stopping container for site: $SITE"
+  CONTAINERID=`docker ps | grep $HTTP | awk '{ print $1 }'`
+  docker stop $CONTAINERID
+}
+
+function status(){
+  printf "%-20s %-15s %-15s\n" "Site name:" "state:" "url:"
+  for D in `find $LOCAL_SITES/* -maxdepth 0 -type d `;
+    do
+      source $D/ports
+
+      CONTAINERID=`docker ps | grep $HTTP | awk '{ print $1 }'`
+
+      SITE_NAME=`basename $D`
+      if [ ! -z $CONTAINERID ]; then
+        printf "%-20s %-15s %-15s\n" $SITE_NAME "running" "http://kran:"$HTTP
+      else
+        printf "%-20s %-15s %-15s\n" $SITE_NAME "-" "-"
+      fi
+    done
 }
 
 function build(){
-  cat ~/.ssh/id_rsa.pub > ~/.kran/wheezy/adds/id_rsa.pub;
-  cd ~/.kran/wheezy; docker build --rm -t="tth/wheezy" .;
+  if [ -d "~/.kran/images/$2" ]; then
+      cat ~/.ssh/id_rsa.pub > ~/.kran/images/$2/adds/id_rsa.pub;
+      cd ~/.kran/images/$2; docker build --rm -t="kran/$2" .;
+    exit;
+  fi
+
+  for D in `find ~/.kran/images/* -maxdepth 0 -type d `
+    do
+      IMAGE_NAME=`basename $D`
+      cat ~/.ssh/id_rsa.pub > $D/adds/id_rsa.pub;
+      cd $D; docker build --rm -t="kran/$IMAGE_NAME" .;
+    done
 }
 
 function connect_ssh(){
+  ARGS="${@:2}"
   echo "Connecting to container via ssh"
-  echo "root password is root"
 
   # Remove the old entry for known_hosts (changes on each build)
-  ssh-keygen -f "/home/tth/.ssh/known_hosts" -R [localhost]:$SSH > /dev/null 2>&1
+  ssh-keygen -f "~/.ssh/known_hosts" -R [kran]:$SSH > /dev/null 2>&1
 
-  # Dont store knownhosts, dont check
-  ssh -o 'UserKnownHostsFile /dev/null' -o 'StrictHostKeyChecking no' -o 'LogLevel=quiet' root@localhost -p $SSH
+  if [[ -z $ARGS ]]; then
+    # Dont store knownhosts, dont check
+    ssh -o 'UserKnownHostsFile /dev/null' -o 'StrictHostKeyChecking no' -o 'LogLevel=quiet' root@kran -p $SSH
+  else
+    ssh -n -o 'UserKnownHostsFile /dev/null' -o 'StrictHostKeyChecking no' -o 'LogLevel=quiet' root@kran -p $SSH "$ARGS"
+  fi
 }
 
-function drush_cmd(){
-  ARGS="${@:2}"
-
-  # Remove the old entry for known_hosts (changes on each build)
-  ssh-keygen -f "/home/tth/.ssh/known_hosts" -R [localhost]:$SSH > /dev/null 2>&1
-
-  ssh -o 'UserKnownHostsFile /dev/null' -o 'StrictHostKeyChecking no' -o 'LogLevel=quiet' root@localhost -p $SSH "cd /var/$DIR && drush $ARGS"
+function copy_ssh(){
+  scp -o 'UserKnownHostsFile /dev/null' -o 'StrictHostKeyChecking no' -o 'LogLevel=quiet' -P $SSH $2 root@kran:$3
 }
 
 function initalize_site(){
-  source ~/.kran/kran.conf
   if [[ -d "$LOCAL_SITES$2" ]]; then
     echo "Site already exists?"
   else
@@ -123,9 +191,6 @@ function initalize_site(){
     # Add default vhost.
     cp ~/.kran/vhost/000-default $LOCAL_SITES$2/vhost/000-default
 
-    export DOCKER_HOST=tcp://localhost:4243
-    source ~/.kran/kran.conf
-
     # Get latest port.
     source ~/.kran/port.conf
 
@@ -139,21 +204,11 @@ function initalize_site(){
     echo "SSH="$SSHPORT >> $LOCAL_SITES$2/ports
 
     # Fire up container and initialize site with db.
-    # Check if were running on a mac. If we are, we keep mysql
-    # in the vagrant box.
-    if [ "$(uname)" == "Darwin" ]; then
-      PARAMS="run --rm -t -i -p 10900:80 -p 10901:22 -dns 8.8.8.8\
-        -v $SITES$2/www:/var/www\
-        -v /mnt/sda/lib/mysql:/var/lib/mysql\
-       tth/wheezy /opt/install_db.sh"
-    else
-      PARAMS="run --rm -t -i -p 10900:80 -p 10901:22 -dns 8.8.8.8\
-        -v $SITES$2/www:/var/www\
-        -v $SITES$2/mysql:/var/lib/mysql\
-       tth/wheezy /opt/install_db.sh"
-    fi
-
-    docker $PARAMS
+    docker run --rm  \
+      -v $SITES$2/mysql:/var/lib/mysql\
+      $IMAGE /opt/install_db.sh
+    echo return
+    exit
   fi
 }
 
@@ -175,14 +230,21 @@ function docker_cleanup(){
   esac
 }
 
-kran_logo
+function print_params(){
+  echo "SITE=$SITE"
+  echo "DIR=$DIR"
+}
 
 case $1 in
-  up) init; start;;
-  build) build;;
-  ssh) init; connect_ssh;;
-  init-site | i) initalize_site $@;;
-  drush | d) init; drush_cmd $@;;
+  up) kran_logo; bootvm; init; start;;
+  stop) kran_logo; init; stop;;
+  status) kran_logo; bootvm; status;;
+  build) kran_logo; bootvm; build;;
+  ssh) init; connect_ssh $@;;
+  scp) init; copy_ssh $@;;
+  init-site | i) bootvm; initalize_site $@;;
   clean) docker_cleanup;;
-  *) kran_usage; exit 1;
+  params) print_params;;
+  bootvm) bootvm up;; 
+  *) kran_logo; kran_usage; exit 1;
 esac
